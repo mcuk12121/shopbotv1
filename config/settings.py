@@ -20,6 +20,10 @@ class Settings:
 
     # Crypto Payment Settings
     CRYPTO_BOT_API_KEY = os.getenv('CRYPTO_BOT_API_KEY', '')
+    # CryptoExpress (new provider)
+    CRYPTO_EXPRESS_API_KEY = os.getenv('CRYPTO_EXPRESS_API_KEY', '')
+    PAYMENT_PROVIDER = os.getenv('PAYMENT_PROVIDER', 'cryptobot')
+    CRYPTO_EXPRESS_WEBHOOK_SECRET = os.getenv('CRYPTO_EXPRESS_WEBHOOK_SECRET', '')
 
     # Telegram Payments (Card) Settings
     # Provider token from @BotFather → your bot → Payments → connect a provider.
