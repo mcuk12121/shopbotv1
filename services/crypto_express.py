@@ -1,102 +1,132 @@
-"""
-CryptoExpress payment service adapter.
+"""KryptoExpress integration for cryptocurrency payments.
 
-Replace the endpoint URLs and request/response parsing with the real CryptoExpress API.
-This adapter exposes the same interface used in handlers (generate_payment_address, check_payment_status).
+Uses the KryptoExpress REST API documented at https://kryptoexpress.pro/api
+
+This adapter creates PAYMENT records (exact fiat -> crypto conversion) and polls the
+public GET /payment?hash=... endpoint to check payment status. It also supports
+providing a callbackUrl and callbackSecret so KryptoExpress signs callbacks.
 """
 
 import requests
 from config.settings import settings
 
+
 class CryptoExpressService:
     def __init__(self):
         self.api_key = settings.CRYPTO_EXPRESS_API_KEY
-        # TODO: replace base_url with your provider's base URL
-        self.base_url = "https://api.cryptoexpress.example"
-        # Paths for invoice creation and retrieval — adjust as required by the real API
-        self.create_invoice_path = "/v1/invoices"
-        self.get_invoice_path = "/v1/invoices"
+        self.base_url = "https://kryptoexpress.pro/api"
+        # Public payment page base (used to build a clickable link)
+        self.public_base = "https://kryptoexpress.pro"
 
-    def _headers(self):
-        return {
-            "Authorization": f"Bearer {self.api_key}",
+    def _headers(self, protected: bool = True):
+        headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        if protected and self.api_key:
+            headers["X-Api-Key"] = self.api_key
+        return headers
 
-    def generate_payment_address(self, amount: float, transaction_id: int, **kwargs) -> str:
+    def generate_payment_address(self, amount: float, transaction_id: int, currency: str = "BTC", **kwargs) -> str:
         """
-        Create an invoice on CryptoExpress and return "invoice_id|pay_url".
+        Create a PAYMENT record for the exact fiat amount and return a string
+        in the format: "{hash}|{pay_url}|{address?}" where pay_url is a public
+        lookup URL and address is the deposit address (if present).
+
+        Args:
+            amount: fiat amount in USD
+            transaction_id: local transaction id (used as external reference)
+            currency: crypto currency code (BTC or LTC)
         """
+        # If API key not configured, return a safe sample fallback
         if not self.api_key:
-            # Development fallback (non-secure)
-            return f"{transaction_id}|https://example.com/pay/{transaction_id}"
+            sample_hash = f"sample_{transaction_id}"
+            pay_url = f"{self.public_base}/payment?hash={sample_hash}"
+            sample_address = "testaddress"
+            return f"{sample_hash}|{pay_url}|{sample_address}"
 
         payload = {
-            "amount": str(amount),
-            "currency": "USD",
-            "external_id": f"txn_{transaction_id}",
-            "description": f"Wallet top-up #{transaction_id}",
-            # If your provider supports passing a webhook URL for callbacks, include it here:
-            # "webhook_url": "https://your-domain/webhook/cryptoexpress"
+            "fiatCurrency": "USD",
+            "paymentType": "PAYMENT",
+            "fiatAmount": float(amount),
+            "cryptoCurrency": currency,
         }
 
+        # Include callback URL and secret if configured
+        callback_url = getattr(settings, 'CRYPTO_EXPRESS_CALLBACK_URL', '')
+        callback_secret = getattr(settings, 'CRYPTO_EXPRESS_WEBHOOK_SECRET', '')
+        if callback_url:
+            payload["callbackUrl"] = callback_url
+        if callback_secret:
+            payload["callbackSecret"] = callback_secret
+
         try:
-            url = f"{self.base_url}{self.create_invoice_path}"
-            resp = requests.post(url, json=payload, headers=self._headers(), timeout=10)
+            url = f"{self.base_url}/payment"
+            resp = requests.post(url, json=payload, headers=self._headers(protected=True), timeout=10)
             resp.raise_for_status()
             data = resp.json()
 
-            # Parse response — adapt to your provider's schema
-            invoice_id = data.get("id") or data.get("invoice_id")
-            pay_url = data.get("pay_url") or data.get("payment_url") or data.get("url")
+            # Expected: response contains fields like 'hash' and 'address'
+            invoice_hash = data.get("hash")
+            address = data.get("address")
 
-            if invoice_id and pay_url:
-                return f"{invoice_id}|{pay_url}"
-            else:
-                print("CryptoExpress: missing invoice_id or pay_url in create response:", data)
-                return None
+            # Construct a public pay URL the user can open
+            pay_url = f"{self.public_base}/payment?hash={invoice_hash}"
+
+            if invoice_hash:
+                # Return hash|pay_url|address (address optional)
+                if address:
+                    return f"{invoice_hash}|{pay_url}|{address}"
+                return f"{invoice_hash}|{pay_url}"
+
+            return None
 
         except Exception as e:
-            print("Error creating CryptoExpress invoice:", e)
+            print(f"Error creating KryptoExpress payment: {e}")
+            try:
+                # debug print body if available
+                print(resp.text)
+            except Exception:
+                pass
             return None
 
     def check_payment_status(self, crypto_address: str, expected_amount: float) -> bool:
         """
-        Poll the provider for invoice status. crypto_address expected format: 'invoice_id|pay_url'
-        Returns True when the invoice is confirmed/paid.
+        Check payment status using the public GET /payment?hash=... endpoint.
+        crypto_address is expected to start with the hash (the first segment).
+        Returns True if payment is confirmed (isPaid == true or paidAt present).
         """
-        if not self.api_key:
-            return False
-
-        invoice_id = crypto_address.split("|", 1)[0] if "|" in crypto_address else crypto_address
-
-        if not invoice_id:
-            return False
-
         try:
-            url = f"{self.base_url}{self.get_invoice_path}/{invoice_id}"
-            resp = requests.get(url, headers=self._headers(), timeout=10)
+            if not crypto_address:
+                return False
+
+            # crypto_address may be of format: hash|pay_url|address or hash|pay_url
+            invoice_hash = crypto_address.split("|")[0]
+            if not invoice_hash:
+                return False
+
+            url = f"{self.base_url}/payment"
+            params = {"hash": str(invoice_hash)}
+
+            resp = requests.get(url, params=params, headers=self._headers(protected=False), timeout=10)
             resp.raise_for_status()
             data = resp.json()
 
-            # Adapt parsing to the real response
-            status = data.get("status")
-            paid_amount = data.get("paid_amount") or data.get("amount_paid")
+            # data contains isPaid and paidAt according to docs
+            is_paid = data.get("isPaid")
+            paid_at = data.get("paidAt")
 
-            if status == "paid":
+            if is_paid:
                 return True
-
-            if paid_amount:
-                try:
-                    paid_val = float(paid_amount)
-                    if paid_val >= float(expected_amount):
-                        return True
-                except Exception:
-                    pass
+            if paid_at:
+                return True
 
             return False
 
         except Exception as e:
-            print("Error checking CryptoExpress invoice status:", e)
+            print(f"Error checking KryptoExpress payment status: {e}")
+            try:
+                print(resp.text)
+            except Exception:
+                pass
             return False
