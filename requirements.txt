@@ -1,2 +1,3 @@
-# requests is used by the KryptoExpress integration
+# requests and SDK for KryptoExpress
 requests
+kryptoexpress-sdk
